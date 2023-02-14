@@ -103,10 +103,14 @@ def build_dataset(is_train, config):
             ann_file = prefix + "_map.txt"
             prefix = prefix + ".zip@/"
             dataset = CachedImageFolder(config.DATA.DATA_PATH, ann_file, prefix, transform,
-                                        cache_mode=config.DATA.CACHE_MODE if is_train else 'part')
+                                        cache_mode=config.DATA.CACHE_MODE if is_train else 'part', use_zip=True)
         else:
-            root = os.path.join(config.DATA.DATA_PATH, prefix)
-            dataset = datasets.ImageFolder(root, transform=transform)
+            if config.DATA.CACHE_MODE != 'no':
+                dataset = CachedImageFolder(config.DATA.DATA_PATH, '', prefix, transform,
+                                            cache_mode=config.DATA.CACHE_MODE if is_train else 'part', use_zip=False)
+            else:
+                root = os.path.join(config.DATA.DATA_PATH, prefix)
+                dataset = datasets.ImageFolder(root, transform=transform)
         nb_classes = 1000
     elif config.DATA.DATASET == 'imagenet22K':
         prefix = 'ILSVRC2011fall_whole'

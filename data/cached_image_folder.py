@@ -11,6 +11,7 @@ import time
 import torch.distributed as dist
 import torch.utils.data as data
 from PIL import Image
+import numpy as np
 
 from .zipreader import is_zip_path, ZipReader
 
@@ -49,6 +50,25 @@ def make_dataset(dir, class_to_idx, extensions):
                     images.append(item)
 
     return images
+
+
+def make_dataset_np(dir, class_to_idx, extensions):
+    images = []
+    labels = []
+    dir = os.path.expanduser(dir)
+    for target in sorted(os.listdir(dir)):
+        d = os.path.join(dir, target)
+        if not os.path.isdir(d):
+            continue
+
+        for root, _, fnames in sorted(os.walk(d)):
+            for fname in sorted(fnames):
+                if has_file_allowed_extension(fname, extensions):
+                    path = os.path.join(root, fname)
+                    labels.append(class_to_idx[target])
+                    images.append(path)
+
+    return np.asarray(images), np.asarray(labels)
 
 
 def make_dataset_with_ann(ann_file, img_prefix, extensions):
@@ -90,11 +110,14 @@ class DatasetFolder(data.Dataset):
     """
 
     def __init__(self, root, loader, extensions, ann_file='', img_prefix='', transform=None, target_transform=None,
-                 cache_mode="no"):
+                 cache_mode="no", use_zip=True):
         # image folder mode
         if ann_file == '':
             _, class_to_idx = find_classes(root)
-            samples = make_dataset(root, class_to_idx, extensions)
+            # samples = make_dataset(root, class_to_idx, extensions)
+            images, labels = make_dataset_np(root, class_to_idx, extensions)
+            samples = images
+            print(f'global_rank {dist.get_rank()} {images.dtype = } {labels.dtype = }')
         # zip mode
         else:
             samples = make_dataset_with_ann(os.path.join(root, ann_file),
@@ -110,12 +133,17 @@ class DatasetFolder(data.Dataset):
         self.extensions = extensions
 
         self.samples = samples
-        self.labels = [y_1k for _, y_1k in samples]
+        #self.labels = [y_1k for _, y_1k in samples]
+        self.images = images
+        self.labels = labels
         self.classes = list(set(self.labels))
+        
+        self.world_size = dist.get_world_size()
 
         self.transform = transform
         self.target_transform = target_transform
 
+        self.use_zip = use_zip
         self.cache_mode = cache_mode
         if self.cache_mode != "no":
             self.init_cache()
@@ -126,21 +154,51 @@ class DatasetFolder(data.Dataset):
         global_rank = dist.get_rank()
         world_size = dist.get_world_size()
 
+        # if self.cache_mode == "part":
+        #     n_subset = n_sample // world_size
+        #     samples_bytes = [None for _ in range(n_subset)]
+        #     samples_labels = [None for _ in range(n_subset)]
+        # else:
         samples_bytes = [None for _ in range(n_sample)]
+        samples_labels = [None for _ in range(n_sample)]
         start_time = time.time()
         for index in range(n_sample):
             if index % (n_sample // 10) == 0:
                 t = time.time() - start_time
                 print(f'global_rank {dist.get_rank()} cached {index}/{n_sample} takes {t:.2f}s per block')
                 start_time = time.time()
-            path, target = self.samples[index]
+            #path, target = self.samples[index]
+            path = self.images[index]
+            target = self.labels[index]
             if self.cache_mode == "full":
-                samples_bytes[index] = (ZipReader.read(path), target)
+                if self.use_zip:
+                    # samples_bytes[index] = (ZipReader.read(path), target)
+                    samples_bytes[index] = ZipReader.read(path)
+                    samples_labels[index] = target
+                else:
+                    with open(path, 'rb') as f:
+                        #samples_bytes[index] = (f.read(), target)
+                        samples_bytes[index] = f.read()
+                    samples_labels[index] = target
             elif self.cache_mode == "part" and index % world_size == global_rank:
-                samples_bytes[index] = (ZipReader.read(path), target)
+                if self.use_zip:
+                    #samples_bytes[index] = (ZipReader.read(path), target)
+                    samples_bytes[index // world_size] = ZipReader.read(path)
+                    samples_labels[index // world_size] = target
+                else:
+                    with open(path, 'rb') as f:
+                        #samples_bytes[index] = (f.read(), target)
+                        samples_bytes[index // world_size] = f.read()
+                    samples_labels[index // world_size] = target
             else:
-                samples_bytes[index] = (path, target)
-        self.samples = samples_bytes
+                #samples_bytes[index] = (path, target)
+                samples_bytes[index] = path
+                samples_labels[index] = target
+        #self.samples = samples_bytes
+        self.images = np.asarray(samples_bytes)
+        self.labels = np.asarray(samples_labels)
+
+        print(f'global_rank {dist.get_rank()} {self.images.dtype = } {self.labels.dtype = }')
 
     def __getitem__(self, index):
         """
@@ -149,7 +207,13 @@ class DatasetFolder(data.Dataset):
         Returns:
             tuple: (sample, target) where target is class_index of the target class.
         """
-        path, target = self.samples[index]
+        if self.cache_mode == "part":
+            index = index // self.world_size
+
+        #path, target = self.samples[index]
+        path = self.images[index]
+        target = self.labels[index]
+
         sample = self.loader(path)
         if self.transform is not None:
             sample = self.transform(sample)
@@ -226,11 +290,11 @@ class CachedImageFolder(DatasetFolder):
     """
 
     def __init__(self, root, ann_file='', img_prefix='', transform=None, target_transform=None,
-                 loader=default_img_loader, cache_mode="no"):
+                 loader=default_img_loader, cache_mode="no", use_zip=True):
         super(CachedImageFolder, self).__init__(root, loader, IMG_EXTENSIONS,
                                                 ann_file=ann_file, img_prefix=img_prefix,
                                                 transform=transform, target_transform=target_transform,
-                                                cache_mode=cache_mode)
+                                                cache_mode=cache_mode, use_zip=use_zip)
         self.imgs = self.samples
 
     def __getitem__(self, index):
@@ -240,7 +304,13 @@ class CachedImageFolder(DatasetFolder):
         Returns:
             tuple: (image, target) where target is class_index of the target class.
         """
-        path, target = self.samples[index]
+        if self.cache_mode == "part":
+            index = index // self.world_size
+
+        #path, target = self.samples[index]
+        path = self.images[index]
+        target = self.labels[index]
+
         image = self.loader(path)
         if self.transform is not None:
             img = self.transform(image)
