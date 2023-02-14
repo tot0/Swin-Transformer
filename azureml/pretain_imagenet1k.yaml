@@ -1,0 +1,50 @@
+$schema: https://azuremlschemas.azureedge.net/latest/pipelineJob.schema.json
+type: pipeline
+
+# <inputs_and_outputs>
+inputs:
+  training_images:
+    type: uri_folder
+    mode: download # pick ro_mount, rw_mount or download
+    # path: azureml://datastores/dlbenchmarkdatablobstandard/paths/azureml-vision-datasets/dogs/**
+    path: azureml://datastores/imagenet/paths/data/imagenet/
+# </inputs_and_outputs>
+
+# <jobs>
+settings:
+  default_datastore: azureml:workspaceblobstore
+  continue_on_step_failure: true
+
+jobs:
+  train:
+    type: command
+    component: file:./components/train/train.yaml
+    compute: azureml:a100-900ram-low
+    resources:
+      instance_count: 1 # number of nodes
+      # shm_size: "64g" # shared memory size in GB
+
+    environment_variables:
+      NCCL_DEBUG: "INFO" # adjusts the level of info from NCCL tests
+
+      # NCCL_TOPO_FILE: "/opt/microsoft/ndv4-topo.xml" # Use specific topology file for A100
+      # NCCL_IB_PCI_RELAXED_ORDERING: "1" # Relaxed Ordering can greatly help the performance of Infiniband networks in virtualized environments.
+      # NCCL_IB_DISABLE: "1" # force disable infiniband (if set to "1")
+      # NCCL_NET_PLUGIN: "none" # to force NET/Plugin off (no rdma/sharp plugin at all)
+      # NCCL_NET: "Socket" # to force node-to-node comm to use Socket (slow)
+      # NCCL_SOCKET_IFNAME: "eth0" # to force Socket comm to use eth0 (use NCCL_NET=Socket)
+      # UCX_IB_PCI_RELAXED_ORDERING: "on"
+      # UCX_TLS: "tcp"
+      # UCX_NET_DEVICES: "eth0" # if you have Error: Failed to resolve UCX endpoint...
+      # CUDA_DEVICE_ORDER: "PCI_BUS_ID" # ordering of gpus
+      # TORCH_DISTRIBUTED_DEBUG: "DETAIL"
+
+    inputs:
+      # data inputs
+      imagenet_data: ${{parent.inputs.training_images}}
+      # model config
+      config_file: configs/swin/swinv2_small_patch4_window8_256.yaml
+      # data loading
+      batch_size: 128
+      num_gpus: 8
+      job_tag: test_tag

@@ -1,0 +1,6 @@
+$schema: https://azuremlschemas.azureedge.net/latest/data.schema.json
+
+type: mltable
+name: imagenet_smallfiles_tenpercent
+description: tenpercent sample of imagenet
+path: ./

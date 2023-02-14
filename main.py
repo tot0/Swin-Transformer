@@ -11,6 +11,7 @@ import json
 import random
 import argparse
 import datetime
+import mlflow
 import numpy as np
 
 import torch
@@ -29,6 +30,10 @@ from logger import create_logger
 from utils import load_checkpoint, load_pretrained, save_checkpoint, NativeScalerWithGradNormCount, auto_resume_helper, \
     reduce_tensor
 
+from azureml.components.common.netmon import NetmonThread, NetmonProc
+from azureml.components.common.profiling import LogTimeBlock, LogDiskIOBlock
+
+SCRIPT_START_TIME = time.time()
 
 def parse_option():
     parser = argparse.ArgumentParser('Swin Transformer training and evaluation script', add_help=False)
@@ -59,12 +64,12 @@ def parse_option():
                         help='mixed precision opt level, if O0, no amp is used (deprecated!)')
     parser.add_argument('--output', default='output', type=str, metavar='PATH',
                         help='root of output folder, the full path is <output>/<model_name>/<tag> (default: output)')
-    parser.add_argument('--tag', help='tag of experiment')
+    parser.add_argument('--tag', default=None, help='tag of experiment')
     parser.add_argument('--eval', action='store_true', help='Perform evaluation only')
     parser.add_argument('--throughput', action='store_true', help='Test throughput only')
 
     # distributed training
-    parser.add_argument("--local_rank", type=int, required=True, help='local rank for DistributedDataParallel')
+    parser.add_argument("--local_rank", type=int, default=int(os.environ['LOCAL_RANK']), help='local rank for DistributedDataParallel')
 
     # for acceleration
     parser.add_argument('--fused_window_process', action='store_true',
@@ -74,18 +79,164 @@ def parse_option():
     parser.add_argument('--optim', type=str,
                         help='overwrite optimizer if provided, can be adamw/sgd/fused_adam/fused_lamb.')
 
+    parser.add_argument('--enable_netmon', action='store_true', help='Start Thread monitoring network throughput.')
+
     args, unparsed = parser.parse_known_args()
 
     config = get_config(args)
 
     return args, config
 
+def start_profiler(config):
+    from pathlib import Path
+    import os
+    import time
+    import json
+    import logging
+    import torch
+    from torch.autograd import DeviceType
+    from packaging import version
+    logger.info('Starting profiler')
+
+    # add profiler activities (CPU/GPU)
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    if torch.cuda.is_available():
+        logger.info("Enabling CUDA in profiler.")
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+
+    # create a function that will be called every time
+    # a "trace" is ready (see on_trace_ready)
+    rank = dist.get_rank()
+    dir_name = str(Path(config.LOG_OUTPUT_DIR) / 'profile')
+    # TODO: Have profiler setup like this be easy import from a lib in azureml?
+
+    def json_trace_handler(dir_name: str, rank: int = 0):
+        """Use inside torch.profiler call to output tables in JSON format."""
+
+        def _handler_fn(prof) -> None:
+            if not os.path.isdir(dir_name):
+                try:
+                    os.makedirs(dir_name, exist_ok=True)
+                except Exception:
+                    raise RuntimeError("Can't create directory: " + dir_name)
+
+            # Note: trying to identify a unique name for the file
+            file_name = os.path.join(
+                dir_name,
+                f"stacks_rank{rank}_step{prof.step_num}_t{int(time.time() * 1000)}.json",
+            )
+
+            logging.getLogger(__name__).info(
+                f"Exporting profiler trace as json at {file_name}"
+            )
+
+            event_list = prof.key_averages()
+
+            with open(file_name, "w") as out_file:
+                for event in event_list:
+                    out_file.write(
+                        json.dumps(
+                            {
+                                "key": event.key,
+                                "count": event.count,
+                                "node_id": event.node_id,
+                                "cpu_time_total": event.cpu_time_total,
+                                "cuda_time_total": event.cuda_time_total,
+                                "self_cpu_time_total": event.self_cpu_time_total,
+                                "self_cuda_time_total": event.self_cuda_time_total,
+                                "cpu_memory_usage": event.cpu_memory_usage,
+                                "cuda_memory_usage": event.cuda_memory_usage,
+                                "self_cpu_memory_usage": event.self_cpu_memory_usage,
+                                "self_cuda_memory_usage": event.self_cuda_memory_usage,
+                                "device_type": "CUDA"
+                                if event.device_type == DeviceType.CUDA
+                                else "CPU",
+                                "is_legacy": event.is_legacy,
+                                "flops": event.flops,
+                            }
+                        )
+                    )
+                    out_file.write("\n")
+
+        return _handler_fn
+
+    def composite_trace_handler(handler_list):
+        """Combine multiple trace handlers inside one."""
+        def _handler_fn(prof) -> None:
+            for handler in handler_list:
+                handler(prof)
+
+        return _handler_fn
+
+    trace_handlers = []
+
+    # export in JSON
+    logger.info("Setting up profiler to export in json format")
+    json_logs_export = os.path.join(dir_name, "json")
+    trace_handlers.append(json_trace_handler(json_logs_export, rank=rank))
+
+    # export tensorboard
+    if version.parse(torch.__version__) >= version.parse("1.11.1"):
+        logger.info(
+            "Setting up profiler to export tensorboard traces using tensorboard_trace_handler"
+        )
+        tensorboard_logs_export = os.path.join(config.TENSORBOARD_OUTPUT_DIR, "tensorboard_logs")
+        trace_handlers.append(
+            torch.profiler.tensorboard_trace_handler(tensorboard_logs_export)
+        )
+    else:
+        # NOTE: tensorboard_trace_handler segfaults in pytorch 1.11.0
+        logger.warning(
+            "You're using a version of torch before 1.11.1, which introduces a bug fix to tensorboard_trace_handler. We will NOT export tensorboard traces."
+        )
+
+    # profiler takes 1 handler, we're composing all above in a single handler
+    trace_handler = composite_trace_handler(trace_handlers)
+
+    # setup profiler to process every single step
+    profiler_schedule = torch.profiler.schedule(wait=0, warmup=0, active=1)
+
+    # initialize profiler
+    profiler = torch.profiler.profile(
+        schedule=profiler_schedule,
+        record_shapes=True,
+        with_flops=True,
+        profile_memory=True,
+        activities=activities,
+        with_stack=True,  # needed to export stacks
+        on_trace_ready=trace_handler,
+    )
+    profiler.start()
+    return profiler
+
+def stop_profiler(config, profiler):
+    from pathlib import Path
+    logger.info("Stopping profiler.")
+    profiler.stop()
+
+    # log via mlflow
+    logger.info(
+        f"MLFLOW log {config.LOG_OUTPUT_DIR}/profile as an artifact."
+    )
+    mlflow.log_artifacts(
+        str(Path(config.LOG_OUTPUT_DIR) / 'profile'), artifact_path="profiler"
+    )
 
 def main(config):
-    dataset_train, dataset_val, data_loader_train, data_loader_val, mixup_fn = build_loader(config)
+    if config.PROFILING:
+        profiler = start_profiler(config)
+
+    # report the time and disk usage during this code block
+    with LogTimeBlock(
+        "build_image_datasets", enabled=dist.get_rank() == 0
+    ), LogDiskIOBlock(
+        "build_image_datasets", enabled=dist.get_rank() == 0
+    ):    
+        dataset_train, dataset_val, data_loader_train, data_loader_val, mixup_fn = build_loader(config)
 
     logger.info(f"Creating model:{config.MODEL.TYPE}/{config.MODEL.NAME}")
-    model = build_model(config)
+    with LogTimeBlock("load_model", enabled=dist.get_rank() == 0):
+        model = build_model(config)
     logger.info(str(model))
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -146,8 +297,15 @@ def main(config):
 
     logger.info("Start training")
     start_time = time.time()
+    mlflow.log_metric("start_to_fit_time", start_time - SCRIPT_START_TIME)
     for epoch in range(config.TRAIN.START_EPOCH, config.TRAIN.EPOCHS):
         data_loader_train.sampler.set_epoch(epoch)
+
+        # we'll collect metrics we want to report for this epoch
+        epoch_metrics = {}
+
+        # start timer for epoch time metric
+        epoch_train_start = time.time()
 
         train_one_epoch(config, model, criterion, data_loader_train, optimizer, epoch, mixup_fn, lr_scheduler,
                         loss_scaler)
@@ -155,14 +313,41 @@ def main(config):
             save_checkpoint(config, epoch, model_without_ddp, max_accuracy, optimizer, lr_scheduler, loss_scaler,
                             logger)
 
+        # stop timer
+        epoch_metrics["epoch_train_time"] = time.time() - epoch_train_start
+
+        # start timer for epoch time metric
+        epoch_eval_start = time.time()
+
         acc1, acc5, loss = validate(config, data_loader_val, model)
         logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
         max_accuracy = max(max_accuracy, acc1)
         logger.info(f'Max accuracy: {max_accuracy:.2f}%')
 
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    logger.info('Training time {}'.format(total_time_str))
+        # stop timer
+        epoch_metrics["epoch_eval_time"] = time.time() - epoch_eval_start
+
+        if config.PROFILING:
+            profiler.step()
+
+        # report metric values in stdout
+        logger.info(f"MLFLOW: metrics={epoch_metrics} epoch={epoch}")
+
+        if dist.get_rank() == 0:
+            mlflow.log_metrics(epoch_metrics)
+
+    end_time = time.time()
+    train_time = end_time - start_time
+    train_time_str = str(datetime.timedelta(seconds=int(train_time)))
+    logger.info('Training time {}'.format(train_time_str))
+
+    mlflow.log_metric("train_time", train_time)
+    mlflow.log_metric("wall_time", end_time - SCRIPT_START_TIME)
+
+    if config.PROFILING:
+        stop_profiler(config, profiler)
+
+    mlflow.end_run()
 
 
 def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mixup_fn, lr_scheduler, loss_scaler):
@@ -306,9 +491,52 @@ if __name__ == '__main__':
     else:
         rank = -1
         world_size = -1
+
+    mlflow.start_run()
+
+    if rank == 0:
+        mlflow.log_params({
+            # log some distribution params
+            "nodes": int(os.environ.get("AZUREML_NODE_COUNT", "1")),
+            "instance_per_node": world_size // int(os.environ.get("AZUREML_NODE_COUNT", "1")),
+            "cuda_available": torch.cuda.is_available(),
+            "config": args.cfg,
+            "pretrained": config.MODEL.PRETRAINED,
+            "accumulation_steps": config.TRAIN.ACCUMULATION_STEPS,
+            "use_checkpoint": config.TRAIN.USE_CHECKPOINT,
+            # data loading params
+            "batch_size": config.DATA.BATCH_SIZE,
+            "num_workers": config.DATA.NUM_WORKERS,
+            "cache_mode": config.DATA.CACHE_MODE,
+            "cpu_count": os.cpu_count(),
+            "zip_mode": config.DATA.ZIP_MODE,
+            # training params
+            "tag": config.TAG,
+            "optim": config.TRAIN.OPTIMIZER.NAME,
+            "fused_layernorm": config.FUSED_LAYERNORM,
+            "fused_window_process": config.FUSED_WINDOW_PROCESS,
+            "disable_amp": args.disable_amp,
+            "epochs": config.TRAIN.EPOCHS,
+            # profiling params
+            #"enable_profiling": self.training_config.enable_profiling,
+            "eval": config.EVAL_MODE,
+            "throughput": config.THROUGHPUT_MODE,
+        })
+
+    if config.LOCAL_RANK == 0:
+        # Start measure_networks in new Thread
+        if args.enable_netmon:
+            import atexit
+            print("Starting Netmon Proc")
+            netmon_thread = NetmonProc()
+            netmon_thread.start()
+            atexit.register(netmon_thread.stop)
+
     torch.cuda.set_device(config.LOCAL_RANK)
     torch.distributed.init_process_group(backend='nccl', init_method='env://', world_size=world_size, rank=rank)
     torch.distributed.barrier()
+
+    # TODO: Setup Torch Profiler?
 
     seed = config.SEED + dist.get_rank()
     torch.manual_seed(seed)
@@ -333,10 +561,11 @@ if __name__ == '__main__':
     config.freeze()
 
     os.makedirs(config.OUTPUT, exist_ok=True)
-    logger = create_logger(output_dir=config.OUTPUT, dist_rank=dist.get_rank(), name=f"{config.MODEL.NAME}")
+    os.makedirs(config.LOG_OUTPUT_DIR, exist_ok=True)
+    logger = create_logger(output_dir=config.LOG_OUTPUT_DIR, dist_rank=dist.get_rank(), name=f"{config.MODEL.NAME}")
 
     if dist.get_rank() == 0:
-        path = os.path.join(config.OUTPUT, "config.json")
+        path = os.path.join(config.LOG_OUTPUT_DIR, "config.json")
         with open(path, "w") as f:
             f.write(config.dump())
         logger.info(f"Full config saved to {path}")

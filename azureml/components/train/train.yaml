@@ -1,0 +1,55 @@
+$schema: https://azuremlschemas.azureedge.net/latest/commandComponent.schema.json
+type: command
+
+name: train_swin
+
+inputs:
+  # data loading
+  imagenet_data:
+    type: path
+    description: "Path to folder containing imagenet data"
+
+  # data loading
+  batch_size:
+    type: integer
+    min: 1
+    optional: true
+    description: "Train/valid data loading batch size (default: 64)"
+  num_gpus:
+    type: integer
+    min: 1
+    optional: false
+    description: "Num gpus to train on"
+
+  job_tag:
+    type: string
+    optional: true
+    description: "Job tag?"
+
+outputs:
+  checkpoints: 
+    type: path
+    description: "Path to export checkpoints"
+  trained_model: 
+    type: path
+    description: "Path to the final model"
+
+code: ../
+
+environment: file:./acpt_env/env.yaml
+
+command: >-
+  python -m torch.distributed.launch --nproc_per_node ${{inputs.num_gpus} --master_port 12345  main.py 
+  --cfg ${{inputs.config_file}}
+  --data-path ${{inputs.imagenet_data}}
+  $[[--batch-size ${{inputs.batch_size}}]] 
+  $[[--output ${{outputs.trained_model}}]] 
+  $[[--tag ${{inputs.job_tag}}]]
+
+distribution:
+  # NOTE: using type:pytorch will use all the right env variables for pytorch init_process_group
+  type: mpi
+  process_count_per_instance: 1
+
+resources:
+  shm_size: "64g" # shared memory size in GB

@@ -259,6 +259,10 @@ _C.LOCAL_RANK = 0
 # for acceleration
 _C.FUSED_WINDOW_PROCESS = False
 _C.FUSED_LAYERNORM = False
+# Enable pytorch profiling
+_C.PROFILING = False
+_C.TENSORBOARD_OUTPUT_DIR = ''
+_C.LOG_OUTPUT_DIR = ''
 
 
 def _update_config_from_file(config, cfg_file):
@@ -337,7 +341,12 @@ def update_config(config, args):
     config.LOCAL_RANK = args.local_rank
 
     # output folder
-    config.OUTPUT = os.path.join(config.OUTPUT, config.MODEL.NAME, config.TAG)
+    config.OUTPUT = os.path.join(config.OUTPUT, config.MODEL.NAME)
+    if config.TAG:
+        config.OUTPUT = os.path.join(config.OUTPUT, config.TAG)
+    # TODO: config.CHECKPOINT_PATH
+    # TODO: config.LOG_OUTPUT
+    # TODO: config.MODEL_OUTPUT
 
     config.freeze()
 

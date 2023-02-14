@@ -1,0 +1,27 @@
+$schema: http://azureml/sdk-2-0/MLTable.json
+type: mltable
+
+paths:
+  - folder: azureml://datastores/imagenet/paths/data/imagenet/
+
+transformations:
+  - take_random_sample:
+      probability: 0.1
+      seed: 333
+  # - add_columns:
+  #   language: python
+  #   exppressions:
+  #     - new_column: stream_size
+  #       prior_column: Path
+  #       function_source: GetStreamProperties(Path).Size
+  #     - new_column: train
+  #       prior_column: Path
+  #       function_source: GetResourceName(Path).startswith("imagenet/data/imagenet/train")
+  # - summurize:
+  #   aggregates:
+  #     - source_column: stream_size
+  #       aggregate: sum
+  #       new_column: total_size
+  #     - source_column: stream_size
+  #       aggregate: sum
+  #       new_column: total_size
